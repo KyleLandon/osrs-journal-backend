@@ -1,0 +1,20 @@
+# OSRS Journal — Supabase project config
+# Deploy: supabase functions deploy (requires Supabase CLI + linked project)
+
+[functions.pair-init]
+verify_jwt = false
+
+[functions.pair-claim]
+verify_jwt = true
+
+[functions.sync]
+verify_jwt = false
+
+[functions.localhost-session]
+verify_jwt = false
+
+[functions.localhost-read]
+verify_jwt = false
+
+[functions.account-delete]
+verify_jwt = true
