@@ -22,5 +22,8 @@ verify_jwt = true
 [functions.networth]
 verify_jwt = true
 
+[functions.goals]
+verify_jwt = true
+
 [functions.health]
 verify_jwt = false

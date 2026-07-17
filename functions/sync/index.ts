@@ -25,6 +25,8 @@ type SyncBody = {
   player_quests?: Record<string, unknown>[];
   player_equipment?: Record<string, unknown>[];
   player_bank?: Record<string, unknown>[];
+  player_diaries?: Record<string, unknown>[];
+  player_combat_achievements?: Record<string, unknown>[];
   replace_equipment?: boolean;
   replace_bank?: boolean;
   touch_last_synced?: boolean;
@@ -83,7 +85,9 @@ Deno.serve(async (req) => {
       body.player_skills?.length ||
         body.player_quests?.length ||
         body.player_equipment?.length ||
-        body.player_bank?.length,
+        body.player_bank?.length ||
+        body.player_diaries?.length ||
+        body.player_combat_achievements?.length,
     );
 
     // players row must exist before skills/quests (FK). Errors here are non-fatal
@@ -138,6 +142,28 @@ Deno.serve(async (req) => {
         onConflict: "rsn,item_id",
       });
       if (error) errors.push(`bank: ${error.message}`);
+    }
+    if (body.player_diaries?.length) {
+      const rows = body.player_diaries.map((r) => ({
+        ...r,
+        rsn: (r.rsn as string) ?? rsn,
+        updated_at: new Date().toISOString(),
+      }));
+      const { error } = await admin.from("player_diaries").upsert(rows, {
+        onConflict: "rsn,region,tier",
+      });
+      if (error) errors.push(`diaries: ${error.message}`);
+    }
+    if (body.player_combat_achievements?.length) {
+      const rows = body.player_combat_achievements.map((r) => ({
+        ...r,
+        rsn: (r.rsn as string) ?? rsn,
+        updated_at: new Date().toISOString(),
+      }));
+      const { error } = await admin.from("player_combat_achievements").upsert(rows, {
+        onConflict: "rsn,tier",
+      });
+      if (error) errors.push(`combat_achievements: ${error.message}`);
     }
 
     if (body.touch_last_synced !== false) {
