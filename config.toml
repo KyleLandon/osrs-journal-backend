@@ -19,5 +19,8 @@ verify_jwt = false
 [functions.account-delete]
 verify_jwt = true
 
+[functions.networth]
+verify_jwt = true
+
 [functions.health]
 verify_jwt = false
