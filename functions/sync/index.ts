@@ -101,6 +101,25 @@ Deno.serve(async (req) => {
         onConflict: "rsn,skill",
       });
       if (error) errors.push(`skills: ${error.message}`);
+
+      // Daily XP snapshot: one row per skill per UTC day, last write wins.
+      // Powers gains graphs / recommendations; non-fatal if it fails.
+      const today = new Date().toISOString().slice(0, 10);
+      const snaps = body.player_skills
+        .filter((r) => r.skill != null && r.xp != null)
+        .map((r) => ({
+          rsn: (r.rsn as string) ?? rsn,
+          snap_date: today,
+          skill: r.skill,
+          level: r.level ?? 1,
+          xp: r.xp,
+        }));
+      if (snaps.length) {
+        const { error: snapError } = await admin
+          .from("player_snapshots")
+          .upsert(snaps, { onConflict: "rsn,snap_date,skill" });
+        if (snapError) errors.push(`snapshots: ${snapError.message}`);
+      }
     }
     if (body.player_quests?.length) {
       const { error } = await admin.from("player_quests").upsert(body.player_quests, {
