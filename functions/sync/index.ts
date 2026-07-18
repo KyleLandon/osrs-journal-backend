@@ -27,6 +27,8 @@ type SyncBody = {
   player_bank?: Record<string, unknown>[];
   player_diaries?: Record<string, unknown>[];
   player_combat_achievements?: Record<string, unknown>[];
+  /** Inventory snapshot (counted with bank for ownership / quantities). */
+  inventory_tracked?: unknown[];
   replace_equipment?: boolean;
   replace_bank?: boolean;
   touch_last_synced?: boolean;
@@ -87,7 +89,8 @@ Deno.serve(async (req) => {
         body.player_equipment?.length ||
         body.player_bank?.length ||
         body.player_diaries?.length ||
-        body.player_combat_achievements?.length,
+        body.player_combat_achievements?.length ||
+        body.inventory_tracked !== undefined,
     );
 
     // players row must exist before skills/quests (FK). Errors here are non-fatal
@@ -142,6 +145,13 @@ Deno.serve(async (req) => {
         onConflict: "rsn,item_id",
       });
       if (error) errors.push(`bank: ${error.message}`);
+    }
+    if (body.inventory_tracked !== undefined) {
+      const { error } = await admin.from("players").upsert(
+        { rsn, inventory_tracked: body.inventory_tracked ?? [] },
+        { onConflict: "rsn" },
+      );
+      if (error) errors.push(`inventory_tracked: ${error.message}`);
     }
     if (body.player_diaries?.length) {
       const rows = body.player_diaries.map((r) => ({

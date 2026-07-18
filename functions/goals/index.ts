@@ -21,6 +21,7 @@ function sanitizeGoals(raw: unknown): unknown[] | null {
     if (typeof o.label === "string") out.label = o.label.slice(0, 80);
     if (typeof o.quest === "string") out.quest = o.quest.slice(0, 80);
     if (typeof o.roadmap === "string") out.roadmap = o.roadmap.slice(0, 40);
+    if (typeof o.set === "string") out.set = o.set.slice(0, 40);
     if (o.all === true) out.all = true;
     if (o.main === true) out.main = true;
     if (typeof o.id === "string") out.id = o.id.slice(0, 40);

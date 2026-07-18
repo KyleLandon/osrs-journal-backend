@@ -38,7 +38,7 @@ Deno.serve(async (req) => {
   const rsn = session.rsn;
 
   const [players, skills, quests, equipment, bank] = await Promise.all([
-    admin.from("players").select("rsn, last_synced, quest_points").eq("rsn", rsn),
+    admin.from("players").select("rsn, last_synced, quest_points, inventory_tracked").eq("rsn", rsn),
     admin.from("player_skills").select("skill, level, xp").eq("rsn", rsn),
     admin.from("player_quests").select("quest_name, state").eq("rsn", rsn),
     admin.from("player_equipment").select("slot_id, slot_name, item_id, item_name").eq("rsn", rsn),
