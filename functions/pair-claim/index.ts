@@ -9,6 +9,13 @@
  */
 import { handleOptions, jsonResponse, errorResponse } from "../_shared/cors.ts";
 import { adminClient, userClient } from "../_shared/supabase.ts";
+import { checkRateLimit, clientIp } from "../_shared/rate_limit.ts";
+
+// Codes are short-lived but guessable in principle; cap attempts per user and IP.
+const USER_LIMIT = 20;
+const USER_WINDOW_MS = 15 * 60 * 1000;
+const IP_LIMIT = 60;
+const IP_WINDOW_MS = 60 * 60 * 1000;
 
 Deno.serve(async (req) => {
   const options = handleOptions(req);
@@ -41,6 +48,14 @@ Deno.serve(async (req) => {
   const code = body.code?.trim().toUpperCase();
   if (!code) {
     return errorResponse("code is required");
+  }
+
+  const ip = clientIp(req);
+  if (!(await checkRateLimit(`pair-claim:user:${userId}`, USER_LIMIT, USER_WINDOW_MS))) {
+    return errorResponse("Too many claim attempts — try again later", 429);
+  }
+  if (!(await checkRateLimit(`pair-claim:ip:${ip}`, IP_LIMIT, IP_WINDOW_MS))) {
+    return errorResponse("Too many claim attempts — try again later", 429);
   }
 
   const admin = adminClient();

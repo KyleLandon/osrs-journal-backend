@@ -7,8 +7,13 @@
  */
 import { handleOptions, jsonResponse, errorResponse } from "../_shared/cors.ts";
 import { adminClient, resolveSyncToken } from "../_shared/supabase.ts";
+import { checkRateLimit, clientIp } from "../_shared/rate_limit.ts";
 
 const SESSION_TTL_MINUTES = 5;
+const IP_LIMIT = 60;
+const IP_WINDOW_MS = 60 * 60 * 1000;
+const RSN_LIMIT = 15;
+const RSN_WINDOW_MS = 10 * 60 * 1000;
 
 Deno.serve(async (req) => {
   const options = handleOptions(req);
@@ -23,10 +28,19 @@ Deno.serve(async (req) => {
     return errorResponse("X-Sync-Token header required", 401);
   }
 
+  const ip = clientIp(req);
+  if (!(await checkRateLimit(`localhost-session:ip:${ip}`, IP_LIMIT, IP_WINDOW_MS))) {
+    return errorResponse("Too many session requests — try again later", 429);
+  }
+
   const admin = adminClient();
   const resolved = await resolveSyncToken(admin, syncToken);
   if (!resolved) {
     return errorResponse("Invalid sync token", 401);
+  }
+
+  if (!(await checkRateLimit(`localhost-session:rsn:${resolved.rsn.toLowerCase()}`, RSN_LIMIT, RSN_WINDOW_MS))) {
+    return errorResponse("Too many session requests for this character", 429);
   }
 
   // Opportunistic cleanup of expired sessions (indexed on expires_at)

@@ -7,6 +7,12 @@
  */
 import { handleOptions, jsonResponse, errorResponse } from "../_shared/cors.ts";
 import { adminClient } from "../_shared/supabase.ts";
+import { checkRateLimit, clientIp } from "../_shared/rate_limit.ts";
+
+const IP_LIMIT = 300;
+const IP_WINDOW_MS = 60 * 60 * 1000;
+const SESSION_LIMIT = 60;
+const SESSION_WINDOW_MS = 5 * 60 * 1000;
 
 Deno.serve(async (req) => {
   const options = handleOptions(req);
@@ -20,6 +26,14 @@ Deno.serve(async (req) => {
   const sessionToken = url.searchParams.get("session");
   if (!sessionToken) {
     return errorResponse("session query param required");
+  }
+
+  const ip = clientIp(req);
+  if (!(await checkRateLimit(`localhost-read:ip:${ip}`, IP_LIMIT, IP_WINDOW_MS))) {
+    return errorResponse("Too many read requests — try again later", 429);
+  }
+  if (!(await checkRateLimit(`localhost-read:session:${sessionToken}`, SESSION_LIMIT, SESSION_WINDOW_MS))) {
+    return errorResponse("Too many read requests for this session", 429);
   }
 
   const admin = adminClient();
