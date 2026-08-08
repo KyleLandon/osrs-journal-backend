@@ -8,8 +8,9 @@
  * write access to these tables at all.
  *
  * The body is a batch: any combination of players / skills / quests /
- * equipment / bank in one request. Response includes `claimed` so the plugin
- * learns its linked state without a separate pair-init call.
+ * equipment / bank / inventory in one request. Nested row `rsn` fields are
+ * ignored and rewritten to the token-bound RSN. Response includes `claimed`
+ * so the plugin learns its linked state without a separate pair-init call.
  */
 import { handleOptions, jsonResponse, errorResponse } from "../_shared/cors.ts";
 import { adminClient, resolveSyncToken } from "../_shared/supabase.ts";
@@ -27,13 +28,36 @@ type SyncBody = {
   player_bank?: Record<string, unknown>[];
   player_diaries?: Record<string, unknown>[];
   player_combat_achievements?: Record<string, unknown>[];
-  /** Inventory snapshot (counted with bank for ownership / quantities). */
+  /** Inventory rows (item_id, item_name, quantity). Written via atomic replace. */
   inventory_tracked?: unknown[];
+  player_inventory?: Record<string, unknown>[];
   replace_equipment?: boolean;
   replace_bank?: boolean;
+  replace_inventory?: boolean;
   touch_last_synced?: boolean;
   profile_public?: boolean;
 };
+
+/** Force every row onto the token-bound RSN; never trust client-supplied rsn. */
+function forceRsn(
+  rows: Record<string, unknown>[] | undefined,
+  rsn: string,
+): Record<string, unknown>[] {
+  if (!rows?.length) return [];
+  return rows.map((row) => ({ ...row, rsn }));
+}
+
+function asItemJson(rows: unknown[] | undefined): unknown[] {
+  if (!Array.isArray(rows)) return [];
+  return rows.map((row) => {
+    const r = (row && typeof row === "object") ? row as Record<string, unknown> : {};
+    return {
+      item_id: r.item_id,
+      item_name: r.item_name ?? "Unknown",
+      quantity: r.quantity ?? 0,
+    };
+  });
+}
 
 Deno.serve(async (req) => {
   const options = handleOptions(req);
@@ -72,31 +96,110 @@ Deno.serve(async (req) => {
   }
 
   const errors: string[] = [];
+  const criticalErrors: string[] = [];
+
+  const inventoryRows = body.player_inventory ??
+    (Array.isArray(body.inventory_tracked)
+      ? body.inventory_tracked as Record<string, unknown>[]
+      : undefined);
+  const replaceInventory = body.replace_inventory === true ||
+    body.inventory_tracked !== undefined ||
+    body.player_inventory !== undefined;
 
   try {
     if (body.replace_equipment) {
       const { error } = await admin.from("player_equipment").delete().eq("rsn", rsn);
-      if (error) errors.push(`equipment delete: ${error.message}`);
+      if (error) {
+        errors.push(`equipment delete: ${error.message}`);
+        criticalErrors.push(`equipment delete: ${error.message}`);
+      }
     }
+
+    // Bank: prefer atomic RPC when replacing; fall back to delete+upsert.
     if (body.replace_bank) {
-      const { error } = await admin.from("player_bank").delete().eq("rsn", rsn);
-      if (error) errors.push(`bank delete: ${error.message}`);
+      const { error } = await admin.rpc("sync_replace_bank", {
+        p_rsn: rsn,
+        p_items: asItemJson(body.player_bank),
+      });
+      if (error) {
+        // Older DBs without the RPC still work via delete+upsert below.
+        if (/sync_replace_bank|function .* does not exist/i.test(error.message)) {
+          const del = await admin.from("player_bank").delete().eq("rsn", rsn);
+          if (del.error) {
+            errors.push(`bank delete: ${del.error.message}`);
+            criticalErrors.push(`bank delete: ${del.error.message}`);
+          } else if (body.player_bank?.length) {
+            const rows = forceRsn(body.player_bank, rsn);
+            const ups = await admin.from("player_bank").upsert(rows, { onConflict: "rsn,item_id" });
+            if (ups.error) {
+              errors.push(`bank: ${ups.error.message}`);
+              criticalErrors.push(`bank: ${ups.error.message}`);
+            }
+          }
+        } else {
+          errors.push(`bank replace: ${error.message}`);
+          criticalErrors.push(`bank replace: ${error.message}`);
+        }
+      }
+    } else if (body.player_bank?.length) {
+      const rows = forceRsn(body.player_bank, rsn);
+      const { error } = await admin.from("player_bank").upsert(rows, { onConflict: "rsn,item_id" });
+      if (error) {
+        errors.push(`bank: ${error.message}`);
+        criticalErrors.push(`bank: ${error.message}`);
+      }
+    }
+
+    if (replaceInventory) {
+      const { error } = await admin.rpc("sync_replace_inventory", {
+        p_rsn: rsn,
+        p_items: asItemJson(inventoryRows),
+      });
+      if (error) {
+        if (/sync_replace_inventory|function .* does not exist/i.test(error.message)) {
+          const del = await admin.from("player_inventory").delete().eq("rsn", rsn);
+          if (del.error) {
+            errors.push(`inventory delete: ${del.error.message}`);
+            criticalErrors.push(`inventory delete: ${del.error.message}`);
+          } else if (inventoryRows?.length) {
+            const rows = forceRsn(inventoryRows, rsn);
+            const ups = await admin.from("player_inventory").upsert(rows, {
+              onConflict: "rsn,item_id",
+            });
+            if (ups.error) {
+              errors.push(`inventory: ${ups.error.message}`);
+              criticalErrors.push(`inventory: ${ups.error.message}`);
+            }
+          }
+        } else {
+          errors.push(`inventory replace: ${error.message}`);
+          criticalErrors.push(`inventory replace: ${error.message}`);
+        }
+      }
     }
 
     const hasGameData = Boolean(
       body.player_skills?.length ||
         body.player_quests?.length ||
         body.player_equipment?.length ||
+        body.replace_equipment ||
         body.player_bank?.length ||
+        body.replace_bank ||
         body.player_diaries?.length ||
         body.player_combat_achievements?.length ||
-        body.inventory_tracked !== undefined,
+        replaceInventory,
     );
 
-    // players row must exist before skills/quests (FK). Errors here are non-fatal
-    // so a bad players payload cannot block skill/quest updates for existing chars.
+    // players row must exist before skills/quests (FK). Never trust nested rsn /
+    // owner_id / private columns from the client.
     if (body.players?.length) {
-      const { error } = await admin.from("players").upsert(body.players, { onConflict: "rsn" });
+      const safePlayers = forceRsn(body.players, rsn).map((row) => {
+        const out: Record<string, unknown> = { rsn };
+        if (row.quest_points != null) out.quest_points = row.quest_points;
+        if (row.last_synced != null) out.last_synced = row.last_synced;
+        return out;
+      });
+      const { error } = await admin.from("players").upsert(safePlayers, { onConflict: "rsn" });
       if (error) errors.push(`players: ${error.message}`);
     } else if (hasGameData) {
       const { error } = await admin.from("players").upsert({ rsn }, { onConflict: "rsn" });
@@ -104,18 +207,17 @@ Deno.serve(async (req) => {
     }
 
     if (body.player_skills?.length) {
-      const { error } = await admin.from("player_skills").upsert(body.player_skills, {
+      const rows = forceRsn(body.player_skills, rsn);
+      const { error } = await admin.from("player_skills").upsert(rows, {
         onConflict: "rsn,skill",
       });
       if (error) errors.push(`skills: ${error.message}`);
 
-      // Daily XP snapshot: one row per skill per UTC day, last write wins.
-      // Powers gains graphs / recommendations; non-fatal if it fails.
       const today = new Date().toISOString().slice(0, 10);
-      const snaps = body.player_skills
+      const snaps = rows
         .filter((r) => r.skill != null && r.xp != null)
         .map((r) => ({
-          rsn: (r.rsn as string) ?? rsn,
+          rsn,
           snap_date: today,
           skill: r.skill,
           level: r.level ?? 1,
@@ -129,34 +231,26 @@ Deno.serve(async (req) => {
       }
     }
     if (body.player_quests?.length) {
-      const { error } = await admin.from("player_quests").upsert(body.player_quests, {
+      const rows = forceRsn(body.player_quests, rsn);
+      const { error } = await admin.from("player_quests").upsert(rows, {
         onConflict: "rsn,quest_name",
       });
       if (error) errors.push(`quests: ${error.message}`);
     }
     if (body.player_equipment?.length) {
-      const { error } = await admin.from("player_equipment").upsert(body.player_equipment, {
+      const rows = forceRsn(body.player_equipment, rsn);
+      const { error } = await admin.from("player_equipment").upsert(rows, {
         onConflict: "rsn,slot_id",
       });
-      if (error) errors.push(`equipment: ${error.message}`);
-    }
-    if (body.player_bank?.length) {
-      const { error } = await admin.from("player_bank").upsert(body.player_bank, {
-        onConflict: "rsn,item_id",
-      });
-      if (error) errors.push(`bank: ${error.message}`);
-    }
-    if (body.inventory_tracked !== undefined) {
-      const { error } = await admin.from("players").upsert(
-        { rsn, inventory_tracked: body.inventory_tracked ?? [] },
-        { onConflict: "rsn" },
-      );
-      if (error) errors.push(`inventory_tracked: ${error.message}`);
+      if (error) {
+        errors.push(`equipment: ${error.message}`);
+        criticalErrors.push(`equipment: ${error.message}`);
+      }
     }
     if (body.player_diaries?.length) {
-      const rows = body.player_diaries.map((r) => ({
+      const rows = forceRsn(body.player_diaries, rsn).map((r) => ({
         ...r,
-        rsn: (r.rsn as string) ?? rsn,
+        rsn,
         updated_at: new Date().toISOString(),
       }));
       const { error } = await admin.from("player_diaries").upsert(rows, {
@@ -165,9 +259,9 @@ Deno.serve(async (req) => {
       if (error) errors.push(`diaries: ${error.message}`);
     }
     if (body.player_combat_achievements?.length) {
-      const rows = body.player_combat_achievements.map((r) => ({
+      const rows = forceRsn(body.player_combat_achievements, rsn).map((r) => ({
         ...r,
-        rsn: (r.rsn as string) ?? rsn,
+        rsn,
         updated_at: new Date().toISOString(),
       }));
       const { error } = await admin.from("player_combat_achievements").upsert(rows, {
@@ -194,11 +288,14 @@ Deno.serve(async (req) => {
       if (error) errors.push(`profile_public: ${error.message}`);
     }
 
+    if (criticalErrors.length) {
+      console.error("sync critical errors for", rsn, criticalErrors);
+      return errorResponse("Sync failed: " + criticalErrors[0], 500);
+    }
+
     if (errors.length) {
       console.error("sync partial errors for", rsn, errors);
-      // Fail only when no game data was written at all.
-      const wroteGameData = hasGameData;
-      if (wroteGameData) {
+      if (hasGameData) {
         return jsonResponse({ ok: true, rsn, claimed: resolved.claimed, warnings: errors });
       }
       return errorResponse("Sync failed", 500);

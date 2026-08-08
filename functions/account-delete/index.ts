@@ -48,6 +48,7 @@ Deno.serve(async (req) => {
   try {
     for (const rsn of rsns) {
       await admin.from("player_bank").delete().eq("rsn", rsn);
+      await admin.from("player_inventory").delete().eq("rsn", rsn);
       await admin.from("player_equipment").delete().eq("rsn", rsn);
       await admin.from("player_quests").delete().eq("rsn", rsn);
       await admin.from("player_skills").delete().eq("rsn", rsn);
