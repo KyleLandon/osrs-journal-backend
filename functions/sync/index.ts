@@ -8,9 +8,10 @@
  * write access to these tables at all.
  *
  * The body is a batch: any combination of players / skills / quests /
- * equipment / bank / inventory in one request. Nested row `rsn` fields are
- * ignored and rewritten to the token-bound RSN. Response includes `claimed`
- * so the plugin learns its linked state without a separate pair-init call.
+ * equipment / bank / inventory / collection log in one request. Nested row
+ * `rsn` fields are ignored and rewritten to the token-bound RSN. Response
+ * includes `claimed` so the plugin learns its linked state without a
+ * separate pair-init call.
  */
 import { handleOptions, jsonResponse, errorResponse } from "../_shared/cors.ts";
 import { adminClient, resolveSyncToken } from "../_shared/supabase.ts";
@@ -18,6 +19,17 @@ import { checkRateLimit } from "../_shared/rate_limit.ts";
 
 const SYNC_LIMIT = 120;
 const SYNC_WINDOW_MS = 60 * 1000;
+
+type CollectionLogItem = {
+  item_id?: unknown;
+  item_name?: unknown;
+  quantity?: unknown;
+};
+
+type CollectionLogPage = {
+  page?: unknown;
+  items?: unknown;
+};
 
 type SyncBody = {
   rsn?: string;
@@ -31,6 +43,10 @@ type SyncBody = {
   /** Inventory rows (item_id, item_name, quantity). Written via atomic replace. */
   inventory_tracked?: unknown[];
   player_inventory?: Record<string, unknown>[];
+  /** Single collection-log page replace. */
+  collection_log?: CollectionLogPage;
+  /** Batch of collection-log page replaces. */
+  collection_log_pages?: CollectionLogPage[];
   replace_equipment?: boolean;
   replace_bank?: boolean;
   replace_inventory?: boolean;
@@ -57,6 +73,34 @@ function asItemJson(rows: unknown[] | undefined): unknown[] {
       quantity: r.quantity ?? 0,
     };
   });
+}
+
+function asCollectionLogItems(items: unknown): unknown[] {
+  if (!Array.isArray(items)) return [];
+  return items.map((row) => {
+    const r = (row && typeof row === "object") ? row as CollectionLogItem : {};
+    return {
+      item_id: r.item_id,
+      item_name: r.item_name ?? "",
+      quantity: r.quantity ?? 1,
+    };
+  });
+}
+
+/** Normalize single-page + multi-page payloads into { page, items }[]. */
+function normalizeCollectionLogPages(body: SyncBody): { page: string; items: unknown[] }[] {
+  const pages: { page: string; items: unknown[] }[] = [];
+  const push = (raw: CollectionLogPage | undefined) => {
+    if (!raw || typeof raw !== "object") return;
+    const page = typeof raw.page === "string" ? raw.page.trim() : "";
+    if (!page) return;
+    pages.push({ page, items: asCollectionLogItems(raw.items) });
+  };
+  if (Array.isArray(body.collection_log_pages)) {
+    for (const p of body.collection_log_pages) push(p);
+  }
+  if (body.collection_log) push(body.collection_log);
+  return pages;
 }
 
 Deno.serve(async (req) => {
@@ -178,6 +222,19 @@ Deno.serve(async (req) => {
       }
     }
 
+    const collectionLogPages = normalizeCollectionLogPages(body);
+    for (const page of collectionLogPages) {
+      const { error } = await admin.rpc("sync_replace_collection_log", {
+        p_rsn: rsn,
+        p_page: page.page,
+        p_items: page.items,
+      });
+      if (error) {
+        errors.push(`collection_log (${page.page}): ${error.message}`);
+        criticalErrors.push(`collection_log (${page.page}): ${error.message}`);
+      }
+    }
+
     const hasGameData = Boolean(
       body.player_skills?.length ||
         body.player_quests?.length ||
@@ -187,7 +244,8 @@ Deno.serve(async (req) => {
         body.replace_bank ||
         body.player_diaries?.length ||
         body.player_combat_achievements?.length ||
-        replaceInventory,
+        replaceInventory ||
+        collectionLogPages.length,
     );
 
     // players row must exist before skills/quests (FK). Never trust nested rsn /

@@ -51,14 +51,18 @@ Deno.serve(async (req) => {
 
   const rsn = session.rsn;
 
-  const [players, skills, quests, equipment, bank, inventory] = await Promise.all([
-    admin.from("players").select("rsn, last_synced, quest_points").eq("rsn", rsn),
-    admin.from("player_skills").select("skill, level, xp").eq("rsn", rsn),
-    admin.from("player_quests").select("quest_name, state").eq("rsn", rsn),
-    admin.from("player_equipment").select("slot_id, slot_name, item_id, item_name").eq("rsn", rsn),
-    admin.from("player_bank").select("item_id, item_name, quantity").eq("rsn", rsn),
-    admin.from("player_inventory").select("item_id, item_name, quantity").eq("rsn", rsn),
-  ]);
+  const [players, skills, quests, equipment, bank, inventory, collectionLog] =
+    await Promise.all([
+      admin.from("players").select("rsn, last_synced, quest_points").eq("rsn", rsn),
+      admin.from("player_skills").select("skill, level, xp").eq("rsn", rsn),
+      admin.from("player_quests").select("quest_name, state").eq("rsn", rsn),
+      admin.from("player_equipment").select("slot_id, slot_name, item_id, item_name").eq("rsn", rsn),
+      admin.from("player_bank").select("item_id, item_name, quantity").eq("rsn", rsn),
+      admin.from("player_inventory").select("item_id, item_name, quantity").eq("rsn", rsn),
+      admin.from("player_collection_log")
+        .select("page, item_id, item_name, quantity")
+        .eq("rsn", rsn),
+    ]);
 
   if (players.error) {
     console.error("localhost-read players", players.error);
@@ -77,5 +81,6 @@ Deno.serve(async (req) => {
     equipment: equipment.data ?? [],
     bank: bank.data ?? [],
     inventory: inventory.data ?? [],
+    collection_log: collectionLog.data ?? [],
   });
 });
