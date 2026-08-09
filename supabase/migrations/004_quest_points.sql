@@ -1,0 +1,1 @@
+../../migrations/004_quest_points.sql

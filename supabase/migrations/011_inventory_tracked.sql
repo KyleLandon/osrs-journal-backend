@@ -1,0 +1,1 @@
+../../migrations/011_inventory_tracked.sql

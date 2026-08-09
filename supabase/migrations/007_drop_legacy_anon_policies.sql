@@ -1,0 +1,1 @@
+../../migrations/007_drop_legacy_anon_policies.sql

@@ -1,0 +1,1 @@
+../../migrations/015_collection_log.sql
