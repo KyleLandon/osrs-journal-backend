@@ -1,0 +1,1 @@
+../../migrations/010_goals_diaries_ca.sql
