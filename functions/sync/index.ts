@@ -26,9 +26,17 @@ type CollectionLogItem = {
   quantity?: unknown;
 };
 
+type CollectionLogKillCount = {
+  name?: unknown;
+  amount?: unknown;
+};
+
 type CollectionLogPage = {
   page?: unknown;
   items?: unknown;
+  obtained?: unknown;
+  obtained_total?: unknown;
+  kill_counts?: unknown;
 };
 
 type SyncBody = {
@@ -87,14 +95,56 @@ function asCollectionLogItems(items: unknown): unknown[] {
   });
 }
 
-/** Normalize single-page + multi-page payloads into { page, items }[]. */
-function normalizeCollectionLogPages(body: SyncBody): { page: string; items: unknown[] }[] {
-  const pages: { page: string; items: unknown[] }[] = [];
+function asKillCounts(raw: unknown): unknown[] {
+  if (!Array.isArray(raw)) return [];
+  const out: unknown[] = [];
+  for (const row of raw) {
+    const r = (row && typeof row === "object") ? row as CollectionLogKillCount : {};
+    const name = typeof r.name === "string" ? r.name.trim() : "";
+    const amount = typeof r.amount === "number"
+      ? r.amount
+      : (typeof r.amount === "string" ? Number(r.amount) : NaN);
+    if (!name || !Number.isFinite(amount)) continue;
+    out.push({ name, amount: Math.trunc(amount) });
+  }
+  return out;
+}
+
+function asOptionalInt(value: unknown): number | null {
+  if (typeof value === "number" && Number.isFinite(value)) return Math.trunc(value);
+  if (typeof value === "string" && value.trim() !== "") {
+    const n = Number(value);
+    if (Number.isFinite(n)) return Math.trunc(n);
+  }
+  return null;
+}
+
+/** Normalize single-page + multi-page payloads into page records. */
+function normalizeCollectionLogPages(body: SyncBody): {
+  page: string;
+  items: unknown[];
+  obtained: number | null;
+  obtained_total: number | null;
+  kill_counts: unknown[];
+}[] {
+  const pages: {
+    page: string;
+    items: unknown[];
+    obtained: number | null;
+    obtained_total: number | null;
+    kill_counts: unknown[];
+  }[] = [];
   const push = (raw: CollectionLogPage | undefined) => {
     if (!raw || typeof raw !== "object") return;
     const page = typeof raw.page === "string" ? raw.page.trim() : "";
     if (!page) return;
-    pages.push({ page, items: asCollectionLogItems(raw.items) });
+    pages.push({
+      page,
+      items: asCollectionLogItems(raw.items),
+      obtained: asOptionalInt(raw.obtained),
+      obtained_total: asOptionalInt(raw.obtained_total),
+      kill_counts: asKillCounts(raw.kill_counts),
+    });
   };
   if (Array.isArray(body.collection_log_pages)) {
     for (const p of body.collection_log_pages) push(p);
@@ -228,10 +278,26 @@ Deno.serve(async (req) => {
         p_rsn: rsn,
         p_page: page.page,
         p_items: page.items,
+        p_obtained: page.obtained,
+        p_obtained_total: page.obtained_total,
+        p_kill_counts: page.kill_counts,
       });
       if (error) {
-        errors.push(`collection_log (${page.page}): ${error.message}`);
-        criticalErrors.push(`collection_log (${page.page}): ${error.message}`);
+        // Older DBs may only have the 3-arg RPC — retry without page metadata.
+        if (/sync_replace_collection_log|function .* does not exist|Could not find the function/i.test(error.message)) {
+          const fallback = await admin.rpc("sync_replace_collection_log", {
+            p_rsn: rsn,
+            p_page: page.page,
+            p_items: page.items,
+          });
+          if (fallback.error) {
+            errors.push(`collection_log (${page.page}): ${fallback.error.message}`);
+            criticalErrors.push(`collection_log (${page.page}): ${fallback.error.message}`);
+          }
+        } else {
+          errors.push(`collection_log (${page.page}): ${error.message}`);
+          criticalErrors.push(`collection_log (${page.page}): ${error.message}`);
+        }
       }
     }
 
@@ -255,6 +321,8 @@ Deno.serve(async (req) => {
         const out: Record<string, unknown> = { rsn };
         if (row.quest_points != null) out.quest_points = row.quest_points;
         if (row.last_synced != null) out.last_synced = row.last_synced;
+        if (row.collection_count != null) out.collection_count = row.collection_count;
+        if (row.collection_count_max != null) out.collection_count_max = row.collection_count_max;
         return out;
       });
       const { error } = await admin.from("players").upsert(safePlayers, { onConflict: "rsn" });
