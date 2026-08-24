@@ -54,6 +54,7 @@ Deno.serve(async (req) => {
       await admin.from("player_quests").delete().eq("rsn", rsn);
       await admin.from("player_skills").delete().eq("rsn", rsn);
       await admin.from("player_snapshots").delete().eq("rsn", rsn);
+      await admin.from("player_xp_snapshots").delete().eq("rsn", rsn);
       await admin.from("player_networth").delete().eq("rsn", rsn);
       await admin.from("player_goals").delete().eq("rsn", rsn);
       await admin.from("player_diaries").delete().eq("rsn", rsn);

@@ -19,6 +19,9 @@ import { checkRateLimit } from "../_shared/rate_limit.ts";
 
 const SYNC_LIMIT = 120;
 const SYNC_WINDOW_MS = 60 * 1000;
+/** Pack skills into one row at most this often (UTC-aligned buckets). */
+const XP_SNAPSHOT_HOURS = 3;
+const XP_SNAPSHOT_KEEP_DAYS = 45;
 
 type CollectionLogItem = {
   item_id?: unknown;
@@ -85,6 +88,29 @@ function asCollectionLogItems(items: unknown): unknown[] {
       quantity: r.quantity ?? 1,
     };
   });
+}
+
+/** Floor `now` to a UTC 3-hour bucket (00:00, 03:00, …). */
+function xpSnapshotBucket(now = new Date()): string {
+  const d = new Date(now);
+  d.setUTCMinutes(0, 0, 0);
+  d.setUTCMilliseconds(0);
+  d.setUTCHours(Math.floor(d.getUTCHours() / XP_SNAPSHOT_HOURS) * XP_SNAPSHOT_HOURS);
+  return d.toISOString();
+}
+
+function packSkillSnapshot(
+  rows: Record<string, unknown>[],
+): Record<string, { level: number; xp: number }> {
+  const skills: Record<string, { level: number; xp: number }> = {};
+  for (const r of rows) {
+    if (typeof r.skill !== "string" || r.xp == null) continue;
+    skills[r.skill] = {
+      level: Number(r.level) || 1,
+      xp: Number(r.xp) || 0,
+    };
+  }
+  return skills;
 }
 
 /** Normalize single-page + multi-page payloads into { page, items }[]. */
@@ -271,21 +297,36 @@ Deno.serve(async (req) => {
       });
       if (error) errors.push(`skills: ${error.message}`);
 
-      const today = new Date().toISOString().slice(0, 10);
-      const snaps = rows
-        .filter((r) => r.skill != null && r.xp != null)
-        .map((r) => ({
-          rsn,
-          snap_date: today,
-          skill: r.skill,
-          level: r.level ?? 1,
-          xp: r.xp,
-        }));
-      if (snaps.length) {
-        const { error: snapError } = await admin
-          .from("player_snapshots")
-          .upsert(snaps, { onConflict: "rsn,snap_date,skill" });
-        if (snapError) errors.push(`snapshots: ${snapError.message}`);
+      const packed = packSkillSnapshot(rows);
+      if (Object.keys(packed).length) {
+        const bucket = xpSnapshotBucket();
+        const { data: existing, error: existErr } = await admin
+          .from("player_xp_snapshots")
+          .select("snapped_at")
+          .eq("rsn", rsn)
+          .eq("snapped_at", bucket)
+          .maybeSingle();
+        if (existErr && !/player_xp_snapshots|schema cache/i.test(existErr.message)) {
+          errors.push(`snapshots lookup: ${existErr.message}`);
+        } else if (!existing) {
+          const { error: snapError } = await admin.from("player_xp_snapshots").insert({
+            rsn,
+            snapped_at: bucket,
+            skills: packed,
+          });
+          if (snapError && !/duplicate key|23505/i.test(snapError.message)) {
+            errors.push(`snapshots: ${snapError.message}`);
+          }
+          if (!snapError && Math.random() < 0.05) {
+            const cutoff = new Date(
+              Date.now() - XP_SNAPSHOT_KEEP_DAYS * 864e5,
+            ).toISOString();
+            await admin.from("player_xp_snapshots").delete().eq("rsn", rsn).lt(
+              "snapped_at",
+              cutoff,
+            );
+          }
+        }
       }
     }
     if (body.player_quests?.length) {
