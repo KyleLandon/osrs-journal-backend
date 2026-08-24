@@ -22,6 +22,8 @@ const SYNC_WINDOW_MS = 60 * 1000;
 /** Pack skills into one row at most this often (UTC-aligned buckets). */
 const XP_SNAPSHOT_HOURS = 3;
 const XP_SNAPSHOT_KEEP_DAYS = 45;
+/** Don't fan out Realtime / website refetch more often than this. */
+const LAST_SYNCED_MIN_SECONDS = 60;
 
 type CollectionLogItem = {
   item_id?: unknown;
@@ -111,6 +113,28 @@ function packSkillSnapshot(
     };
   }
   return skills;
+}
+
+/** Inventory/gear-only payloads should not bump last_synced (Realtime + full page refetch). */
+function isHighChurnOnly(
+  body: SyncBody,
+  replaceInventory: boolean,
+  collectionLogPages: { page: string; items: unknown[] }[],
+): boolean {
+  const heavy = Boolean(
+    body.player_skills?.length ||
+      body.player_quests?.length ||
+      body.players?.length ||
+      body.replace_bank ||
+      body.player_bank?.length ||
+      body.player_diaries?.length ||
+      body.player_combat_achievements?.length ||
+      collectionLogPages.length,
+  );
+  const churn = Boolean(
+    replaceInventory || body.replace_equipment || body.player_equipment?.length,
+  );
+  return churn && !heavy;
 }
 
 /** Normalize single-page + multi-page payloads into { page, items }[]. */
@@ -369,14 +393,25 @@ Deno.serve(async (req) => {
       if (error) errors.push(`combat_achievements: ${error.message}`);
     }
 
-    if (body.touch_last_synced !== false) {
-      const { error } = await admin
-        .from("players")
-        .upsert(
-          { rsn, last_synced: new Date().toISOString() },
-          { onConflict: "rsn" },
-        );
-      if (error) errors.push(`last_synced: ${error.message}`);
+    if (body.touch_last_synced !== false &&
+      !isHighChurnOnly(body, replaceInventory, collectionLogPages)) {
+      const { error } = await admin.rpc("touch_player_last_synced", {
+        p_rsn: rsn,
+        p_min_interval_seconds: LAST_SYNCED_MIN_SECONDS,
+      });
+      if (error) {
+        if (/touch_player_last_synced|function .* does not exist/i.test(error.message)) {
+          const { error: fallbackErr } = await admin
+            .from("players")
+            .upsert(
+              { rsn, last_synced: new Date().toISOString() },
+              { onConflict: "rsn" },
+            );
+          if (fallbackErr) errors.push(`last_synced: ${fallbackErr.message}`);
+        } else {
+          errors.push(`last_synced: ${error.message}`);
+        }
+      }
     }
 
     if (typeof body.profile_public === "boolean" && resolved.claimed) {
