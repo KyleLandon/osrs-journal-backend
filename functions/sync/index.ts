@@ -25,6 +25,23 @@ const XP_SNAPSHOT_KEEP_DAYS = 45;
 /** Don't fan out Realtime / website refetch more often than this. */
 const LAST_SYNCED_MIN_SECONDS = 60;
 
+const STASH_CONTAINERS = new Set([
+  "looting_bag",
+  "poh_magic_wardrobe",
+  "poh_armour",
+  "poh_fancy_dress",
+  "poh_treasure_0",
+  "poh_treasure_1",
+  "poh_treasure_1a",
+  "poh_treasure_2",
+  "poh_treasure_2a",
+  "poh_treasure_3",
+  "poh_treasure_3a",
+  "poh_capes",
+  "poh_capes_2",
+  "poh_holiday",
+]);
+
 type CollectionLogItem = {
   item_id?: unknown;
   item_name?: unknown;
@@ -33,6 +50,11 @@ type CollectionLogItem = {
 
 type CollectionLogPage = {
   page?: unknown;
+  items?: unknown;
+};
+
+type StashPage = {
+  container?: unknown;
   items?: unknown;
 };
 
@@ -48,6 +70,8 @@ type SyncBody = {
   /** Inventory rows (item_id, item_name, quantity). Written via atomic replace. */
   inventory_tracked?: unknown[];
   player_inventory?: Record<string, unknown>[];
+  /** Extra storage (looting bag / POH). Each entry: { container, items }. */
+  player_stashes?: StashPage[];
   /** Single collection-log page replace. */
   collection_log?: CollectionLogPage;
   /** Batch of collection-log page replaces. */
@@ -120,6 +144,7 @@ function isHighChurnOnly(
   body: SyncBody,
   replaceInventory: boolean,
   collectionLogPages: { page: string; items: unknown[] }[],
+  stashPages: { container: string; items: unknown[] }[],
 ): boolean {
   const heavy = Boolean(
     body.player_skills?.length ||
@@ -132,7 +157,10 @@ function isHighChurnOnly(
       collectionLogPages.length,
   );
   const churn = Boolean(
-    replaceInventory || body.replace_equipment || body.player_equipment?.length,
+    replaceInventory ||
+      body.replace_equipment ||
+      body.player_equipment?.length ||
+      stashPages.length,
   );
   return churn && !heavy;
 }
@@ -150,6 +178,19 @@ function normalizeCollectionLogPages(body: SyncBody): { page: string; items: unk
     for (const p of body.collection_log_pages) push(p);
   }
   if (body.collection_log) push(body.collection_log);
+  return pages;
+}
+
+/** Normalize extra-storage payloads into { container, items }[]. */
+function normalizeStashPages(body: SyncBody): { container: string; items: unknown[] }[] {
+  const pages: { container: string; items: unknown[] }[] = [];
+  if (!Array.isArray(body.player_stashes)) return pages;
+  for (const raw of body.player_stashes) {
+    if (!raw || typeof raw !== "object") continue;
+    const container = typeof raw.container === "string" ? raw.container.trim() : "";
+    if (!STASH_CONTAINERS.has(container)) continue;
+    pages.push({ container, items: asItemJson(Array.isArray(raw.items) ? raw.items : []) });
+  }
   return pages;
 }
 
@@ -285,6 +326,19 @@ Deno.serve(async (req) => {
       }
     }
 
+    const stashPages = normalizeStashPages(body);
+    for (const page of stashPages) {
+      const { error } = await admin.rpc("sync_replace_stash", {
+        p_rsn: rsn,
+        p_container: page.container,
+        p_items: page.items,
+      });
+      if (error) {
+        errors.push(`stash (${page.container}): ${error.message}`);
+        criticalErrors.push(`stash (${page.container}): ${error.message}`);
+      }
+    }
+
     const hasGameData = Boolean(
       body.player_skills?.length ||
         body.player_quests?.length ||
@@ -295,7 +349,8 @@ Deno.serve(async (req) => {
         body.player_diaries?.length ||
         body.player_combat_achievements?.length ||
         replaceInventory ||
-        collectionLogPages.length,
+        collectionLogPages.length ||
+        stashPages.length,
     );
 
     // players row must exist before skills/quests (FK). Never trust nested rsn /
@@ -394,7 +449,7 @@ Deno.serve(async (req) => {
     }
 
     if (body.touch_last_synced !== false &&
-      !isHighChurnOnly(body, replaceInventory, collectionLogPages)) {
+      !isHighChurnOnly(body, replaceInventory, collectionLogPages, stashPages)) {
       const { error } = await admin.rpc("touch_player_last_synced", {
         p_rsn: rsn,
         p_min_interval_seconds: LAST_SYNCED_MIN_SECONDS,

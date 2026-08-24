@@ -51,7 +51,7 @@ Deno.serve(async (req) => {
 
   const rsn = session.rsn;
 
-  const [players, skills, quests, equipment, bank, inventory, collectionLog] =
+  const [players, skills, quests, equipment, bank, inventory, stashes, collectionLog] =
     await Promise.all([
       admin.from("players").select("rsn, last_synced, quest_points").eq("rsn", rsn),
       admin.from("player_skills").select("skill, level, xp").eq("rsn", rsn),
@@ -59,6 +59,7 @@ Deno.serve(async (req) => {
       admin.from("player_equipment").select("slot_id, slot_name, item_id, item_name").eq("rsn", rsn),
       admin.from("player_bank").select("item_id, item_name, quantity").eq("rsn", rsn),
       admin.from("player_inventory").select("item_id, item_name, quantity").eq("rsn", rsn),
+      admin.from("player_item_stashes").select("container, item_id, item_name, quantity").eq("rsn", rsn),
       admin.from("player_collection_log")
         .select("page, item_id, item_name, quantity")
         .eq("rsn", rsn),
@@ -81,6 +82,7 @@ Deno.serve(async (req) => {
     equipment: equipment.data ?? [],
     bank: bank.data ?? [],
     inventory: inventory.data ?? [],
+    stashes: stashes.data ?? [],
     collection_log: collectionLog.data ?? [],
   });
 });
