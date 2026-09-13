@@ -7,6 +7,9 @@
  * player's data. All writes run with the service role; client roles have no
  * write access to these tables at all.
  *
+ * Skills go through sync_upsert_skills so unchanged level/xp is a no-op
+ * (avoids 24 Realtime WAL events on every training tick).
+ *
  * The body is a batch: any combination of players / skills / quests /
  * equipment / bank / inventory / collection log in one request. Nested row
  * `rsn` fields are ignored and rewritten to the token-bound RSN. Response
@@ -371,10 +374,25 @@ Deno.serve(async (req) => {
 
     if (body.player_skills?.length) {
       const rows = forceRsn(body.player_skills, rsn);
-      const { error } = await admin.from("player_skills").upsert(rows, {
-        onConflict: "rsn,skill",
+      const skillPayload = rows.map((r) => ({
+        skill: r.skill,
+        level: r.level,
+        xp: r.xp,
+      }));
+      const { error } = await admin.rpc("sync_upsert_skills", {
+        p_rsn: rsn,
+        p_skills: skillPayload,
       });
-      if (error) errors.push(`skills: ${error.message}`);
+      if (error) {
+        if (/sync_upsert_skills|function .* does not exist/i.test(error.message)) {
+          const ups = await admin.from("player_skills").upsert(rows, {
+            onConflict: "rsn,skill",
+          });
+          if (ups.error) errors.push(`skills: ${ups.error.message}`);
+        } else {
+          errors.push(`skills: ${error.message}`);
+        }
+      }
 
       const packed = packSkillSnapshot(rows);
       if (Object.keys(packed).length) {
