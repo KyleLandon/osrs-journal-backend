@@ -2,7 +2,7 @@
  * POST /sync — the plugin's single write path for game data.
  *
  * Auth: X-Sync-Token header. The token is resolved server-side to an RSN
- * (claimed characters first, then unexpired unclaimed pair sessions), and the
+ * (claimed characters only), and the
  * payload may only touch that RSN — so a token can never write another
  * player's data. All writes run with the service role; client roles have no
  * write access to these tables at all.
@@ -17,7 +17,7 @@
  * separate pair-init call.
  */
 import { handleOptions, jsonResponse, errorResponse } from "../_shared/cors.ts";
-import { adminClient, resolveSyncToken } from "../_shared/supabase.ts";
+import { adminClient, resolveSyncToken, hasPendingPairSession } from "../_shared/supabase.ts";
 import { checkRateLimit } from "../_shared/rate_limit.ts";
 
 const SYNC_LIMIT = 120;
@@ -220,10 +220,15 @@ Deno.serve(async (req) => {
   const admin = adminClient();
   const resolved = await resolveSyncToken(admin, syncToken);
   if (!resolved) {
+    // 409 preserves the plugin's pending code. Its existing 401/403 repair
+    // path would otherwise replace that code every time it tries to sync.
+    if (await hasPendingPairSession(admin, syncToken)) {
+      return errorResponse("Pairing pending — claim the code on the website before syncing", 409);
+    }
     return errorResponse("Invalid sync token", 401);
   }
 
-  if (body.rsn && body.rsn !== resolved.rsn) {
+  if (body.rsn && (typeof body.rsn !== "string" || body.rsn.toLowerCase() !== resolved.rsn.toLowerCase())) {
     return errorResponse("RSN does not match sync token", 403);
   }
 

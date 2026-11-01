@@ -61,3 +61,32 @@ design decisions.
 
 `SUPABASE_URL`, `SUPABASE_ANON_KEY`, and `SUPABASE_SERVICE_ROLE_KEY` are injected
 automatically when functions are deployed — no secrets live in this repo.
+
+## Tests and secure pairing rollout
+
+Run `node --test tests/*.test.cjs` with Node 24+. The tests execute the actual
+TypeScript handlers using Node's type stripping and mocked Auth/database calls;
+they never contact production. SQL integration checks are in
+`tests/secure-pairing.sql` and require an isolated Supabase database.
+
+For this release, apply `migrations/022_secure_pair_claim.sql` **before** deploying
+`pair-init`, `pair-claim`, `sync`, and `localhost-session`. The shared token helper
+is bundled with each function. `pair-init` now issues only fresh pending tokens.
+Pending tokens cannot read or write game data; sync returns HTTP 409 until the
+website account claims the code, so existing plugin versions keep displaying the
+same code. Expired/unknown tokens still return 401 and trigger plugin repair.
+Only the existing owner can claim a replacement code; ownership transfer via a
+new public code is disabled. Replacement is atomic and invalidates that
+character's old browser read sessions. Existing valid plugin tokens keep working.
+
+New installations must sign in and claim the plugin code before their first sync.
+Use the original owning website account when reinstalling the plugin. A code is
+an installation-linking mechanism, not independent proof of OSRS account identity.
+
+The prior endpoint could disclose existing tokens. After containment, owners
+should re-pair their installations to replace potentially exposed credentials.
+A full forced rotation is a separate operational action because it disconnects
+all existing installations; this release does not silently perform that action.
+Validate the migration and the full owner pairing/sync/private-read flow in
+staging before production rollout. Publishing Git commits alone does not apply
+Supabase migrations or deploy Edge Functions.

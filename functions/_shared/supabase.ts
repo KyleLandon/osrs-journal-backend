@@ -55,42 +55,36 @@ export function generatePairCode(): string {
   const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
   let raw = "";
   for (let i = 0; i < 8; i++) {
-    raw += chars[Math.floor(Math.random() * chars.length)];
+    raw += chars[crypto.getRandomValues(new Uint32Array(1))[0] % chars.length];
   }
   return raw.slice(0, 4) + "-" + raw.slice(4);
 }
 
-/**
- * Maps a sync token to its RSN. Claimed characters (user_characters) win;
- * otherwise an unexpired, unclaimed pair session is accepted so the plugin can
- * sync during the window between pair-init and the user entering the code.
- * `claimed=false` tells callers the character isn't linked to an account yet.
- */
+/** Only claimed credentials authorize sync writes or private read sessions. */
 export async function resolveSyncToken(
   admin: ReturnType<typeof adminClient>,
   token: string,
 ): Promise<{ rsn: string; claimed: boolean } | null> {
-  const { data: character } = await admin
+  const { data: character, error } = await admin
     .from("user_characters")
     .select("rsn")
     .eq("sync_token", token)
     .maybeSingle();
+  if (error) throw new Error("Could not verify sync token");
+  return character?.rsn ? { rsn: character.rsn, claimed: true } : null;
+}
 
-  if (character?.rsn) {
-    return { rsn: character.rsn, claimed: true };
-  }
-
-  const { data: session } = await admin
-    .from("pair_sessions")
-    .select("rsn, expires_at, claimed_by")
+/** Recognize a pending code without granting it any access to character data. */
+export async function hasPendingPairSession(
+  admin: ReturnType<typeof adminClient>,
+  token: string,
+): Promise<boolean> {
+  const { data, error } = await admin.from("pair_sessions")
+    .select("code")
     .eq("sync_token", token)
     .is("claimed_by", null)
     .gt("expires_at", new Date().toISOString())
     .maybeSingle();
-
-  if (session?.rsn) {
-    return { rsn: session.rsn, claimed: false };
-  }
-
-  return null;
+  if (error) throw new Error("Could not verify pairing session");
+  return Boolean(data);
 }
