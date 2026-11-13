@@ -93,3 +93,4 @@ $$;
 
 REVOKE ALL ON FUNCTION sync_replace_collection_log(text, text, jsonb, int, int, jsonb) FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION sync_replace_collection_log(text, text, jsonb, int, int, jsonb) TO service_role;
+NOTIFY pgrst, 'reload schema';
