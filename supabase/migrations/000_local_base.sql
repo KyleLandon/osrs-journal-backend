@@ -7,10 +7,20 @@
 -- this repo, so a from-scratch `supabase start` has nothing to build on.
 --
 -- This file recreates just enough of those base tables (columns inferred from the
--- Edge Functions and later migrations) so the full 001..015 migration chain, the
+-- Edge Functions and later migrations) so the full migration chain, the
 -- Edge Functions, and the RLS model can run against a local Supabase stack. It is
 -- intentionally NOT part of the repo's migrations/ directory and MUST NOT be
 -- pushed to the production Supabase project (which already has these tables).
+
+-- Safety guard: refuse to run against an existing database (e.g. an accidental
+-- `supabase db push` to production). The GRANTs below would widen anon access.
+DO $$
+BEGIN
+    IF to_regclass('public.players') IS NOT NULL THEN
+        RAISE EXCEPTION '000_local_base.sql is local-only: public.players already exists. Do not push it to a real project.';
+    END IF;
+END
+$$;
 
 -- ── players ──────────────────────────────────────────────────────────────────
 -- owner_id (001), quest_points (004) and inventory_tracked (011, later dropped in
@@ -71,7 +81,7 @@ CREATE TABLE IF NOT EXISTS player_bank (
 -- this the Edge Functions' service-role writes fail ("permission denied for table
 -- pair_sessions", etc.). Rather than the deprecated `auto_expose_new_tables`
 -- config flag, set matching default privileges so the tables created by the
--- 001..015 migrations inherit the expected grants.
+-- repo migrations inherit the expected grants.
 ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON TABLES TO service_role;
 ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON SEQUENCES TO service_role;
 ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT EXECUTE ON FUNCTIONS TO service_role;

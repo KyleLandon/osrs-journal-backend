@@ -32,9 +32,12 @@ The Supabase CLI expects `supabase/config.toml`, `supabase/functions/`, and
   so the `service_role`/`anon`/`authenticated` roles get the grants the Edge Functions
   expect (older Supabase projects auto-granted new tables; local stacks do not, otherwise
   service-role writes fail with `permission denied for table pair_sessions`). **Never push
-  `000_local_base.sql` to the real Supabase project** — it already has these tables.
-- If a new `016_*.sql` (etc.) is added to the repo's `migrations/`, add a matching symlink
-  under `supabase/migrations/` so the local stack applies it.
+  `000_local_base.sql` to the real Supabase project** — it already has these tables. The
+  file aborts if `public.players` already exists, so an accidental push fails before it
+  changes anything.
+- When a new migration is added to the repo's `migrations/`, add a matching symlink under
+  `supabase/migrations/` (`ln -s ../../migrations/NNN_name.sql supabase/migrations/`) so
+  the local stack applies it.
 
 ### Running the stack (from repo root)
 - Start everything: `supabase start` (first run pulls images). Ports: API `54321`,

@@ -1,0 +1,1 @@
+../../migrations/023_collection_log_totals_and_pages.sql

@@ -1,0 +1,1 @@
+../../migrations/018_sync_hot_path.sql

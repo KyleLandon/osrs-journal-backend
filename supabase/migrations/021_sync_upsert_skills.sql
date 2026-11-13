@@ -1,0 +1,1 @@
+../../migrations/021_sync_upsert_skills.sql

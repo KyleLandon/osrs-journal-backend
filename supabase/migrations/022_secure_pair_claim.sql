@@ -1,0 +1,1 @@
+../../migrations/022_secure_pair_claim.sql

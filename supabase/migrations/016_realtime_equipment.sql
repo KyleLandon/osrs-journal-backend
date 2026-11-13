@@ -1,0 +1,1 @@
+../../migrations/016_realtime_equipment.sql
