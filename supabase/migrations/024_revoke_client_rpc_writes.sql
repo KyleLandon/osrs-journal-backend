@@ -1,0 +1,1 @@
+../../migrations/024_revoke_client_rpc_writes.sql
