@@ -1,3 +1,4 @@
+-- (Was 016 on the original branch; renumbered after 016-022 shipped.)
 -- Collection log totals on the player row (VarPlayer COLLECTION_COUNT /
 -- COLLECTION_COUNT_MAX) plus per-page metadata (obtained X/Y and kill counts)
 -- captured when a Collection Log page is opened in RuneLite.

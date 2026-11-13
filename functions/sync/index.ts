@@ -2,10 +2,13 @@
  * POST /sync — the plugin's single write path for game data.
  *
  * Auth: X-Sync-Token header. The token is resolved server-side to an RSN
- * (claimed characters first, then unexpired unclaimed pair sessions), and the
+ * (claimed characters only), and the
  * payload may only touch that RSN — so a token can never write another
  * player's data. All writes run with the service role; client roles have no
  * write access to these tables at all.
+ *
+ * Skills go through sync_upsert_skills so unchanged level/xp is a no-op
+ * (avoids 24 Realtime WAL events on every training tick).
  *
  * The body is a batch: any combination of players / skills / quests /
  * equipment / bank / inventory / collection log in one request. Nested row
@@ -14,11 +17,33 @@
  * separate pair-init call.
  */
 import { handleOptions, jsonResponse, errorResponse } from "../_shared/cors.ts";
-import { adminClient, resolveSyncToken } from "../_shared/supabase.ts";
+import { adminClient, resolveSyncToken, hasPendingPairSession } from "../_shared/supabase.ts";
 import { checkRateLimit } from "../_shared/rate_limit.ts";
 
 const SYNC_LIMIT = 120;
 const SYNC_WINDOW_MS = 60 * 1000;
+/** Pack skills into one row at most this often (UTC-aligned buckets). */
+const XP_SNAPSHOT_HOURS = 3;
+const XP_SNAPSHOT_KEEP_DAYS = 45;
+/** Don't fan out Realtime / website refetch more often than this. */
+const LAST_SYNCED_MIN_SECONDS = 60;
+
+const STASH_CONTAINERS = new Set([
+  "looting_bag",
+  "poh_magic_wardrobe",
+  "poh_armour",
+  "poh_fancy_dress",
+  "poh_treasure_0",
+  "poh_treasure_1",
+  "poh_treasure_1a",
+  "poh_treasure_2",
+  "poh_treasure_2a",
+  "poh_treasure_3",
+  "poh_treasure_3a",
+  "poh_capes",
+  "poh_capes_2",
+  "poh_holiday",
+]);
 
 type CollectionLogItem = {
   item_id?: unknown;
@@ -39,6 +64,11 @@ type CollectionLogPage = {
   kill_counts?: unknown;
 };
 
+type StashPage = {
+  container?: unknown;
+  items?: unknown;
+};
+
 type SyncBody = {
   rsn?: string;
   players?: Record<string, unknown>[];
@@ -51,6 +81,8 @@ type SyncBody = {
   /** Inventory rows (item_id, item_name, quantity). Written via atomic replace. */
   inventory_tracked?: unknown[];
   player_inventory?: Record<string, unknown>[];
+  /** Extra storage (looting bag / POH). Each entry: { container, items }. */
+  player_stashes?: StashPage[];
   /** Single collection-log page replace. */
   collection_log?: CollectionLogPage;
   /** Batch of collection-log page replaces. */
@@ -93,6 +125,55 @@ function asCollectionLogItems(items: unknown): unknown[] {
       quantity: r.quantity ?? 1,
     };
   });
+}
+
+/** Floor `now` to a UTC 3-hour bucket (00:00, 03:00, …). */
+function xpSnapshotBucket(now = new Date()): string {
+  const d = new Date(now);
+  d.setUTCMinutes(0, 0, 0);
+  d.setUTCMilliseconds(0);
+  d.setUTCHours(Math.floor(d.getUTCHours() / XP_SNAPSHOT_HOURS) * XP_SNAPSHOT_HOURS);
+  return d.toISOString();
+}
+
+function packSkillSnapshot(
+  rows: Record<string, unknown>[],
+): Record<string, { level: number; xp: number }> {
+  const skills: Record<string, { level: number; xp: number }> = {};
+  for (const r of rows) {
+    if (typeof r.skill !== "string" || r.xp == null) continue;
+    skills[r.skill] = {
+      level: Number(r.level) || 1,
+      xp: Number(r.xp) || 0,
+    };
+  }
+  return skills;
+}
+
+/** Inventory/gear-only payloads should not bump last_synced (Realtime + full page refetch). */
+function isHighChurnOnly(
+  body: SyncBody,
+  replaceInventory: boolean,
+  collectionLogPages: { page: string; items: unknown[] }[],
+  stashPages: { container: string; items: unknown[] }[],
+): boolean {
+  const heavy = Boolean(
+    body.player_skills?.length ||
+      body.player_quests?.length ||
+      body.players?.length ||
+      body.replace_bank ||
+      body.player_bank?.length ||
+      body.player_diaries?.length ||
+      body.player_combat_achievements?.length ||
+      collectionLogPages.length,
+  );
+  const churn = Boolean(
+    replaceInventory ||
+      body.replace_equipment ||
+      body.player_equipment?.length ||
+      stashPages.length,
+  );
+  return churn && !heavy;
 }
 
 function asKillCounts(raw: unknown): unknown[] {
@@ -153,6 +234,19 @@ function normalizeCollectionLogPages(body: SyncBody): {
   return pages;
 }
 
+/** Normalize extra-storage payloads into { container, items }[]. */
+function normalizeStashPages(body: SyncBody): { container: string; items: unknown[] }[] {
+  const pages: { container: string; items: unknown[] }[] = [];
+  if (!Array.isArray(body.player_stashes)) return pages;
+  for (const raw of body.player_stashes) {
+    if (!raw || typeof raw !== "object") continue;
+    const container = typeof raw.container === "string" ? raw.container.trim() : "";
+    if (!STASH_CONTAINERS.has(container)) continue;
+    pages.push({ container, items: asItemJson(Array.isArray(raw.items) ? raw.items : []) });
+  }
+  return pages;
+}
+
 Deno.serve(async (req) => {
   const options = handleOptions(req);
   if (options) return options;
@@ -176,10 +270,15 @@ Deno.serve(async (req) => {
   const admin = adminClient();
   const resolved = await resolveSyncToken(admin, syncToken);
   if (!resolved) {
+    // 409 preserves the plugin's pending code. Its existing 401/403 repair
+    // path would otherwise replace that code every time it tries to sync.
+    if (await hasPendingPairSession(admin, syncToken)) {
+      return errorResponse("Pairing pending — claim the code on the website before syncing", 409);
+    }
     return errorResponse("Invalid sync token", 401);
   }
 
-  if (body.rsn && body.rsn !== resolved.rsn) {
+  if (body.rsn && (typeof body.rsn !== "string" || body.rsn.toLowerCase() !== resolved.rsn.toLowerCase())) {
     return errorResponse("RSN does not match sync token", 403);
   }
 
@@ -301,6 +400,19 @@ Deno.serve(async (req) => {
       }
     }
 
+    const stashPages = normalizeStashPages(body);
+    for (const page of stashPages) {
+      const { error } = await admin.rpc("sync_replace_stash", {
+        p_rsn: rsn,
+        p_container: page.container,
+        p_items: page.items,
+      });
+      if (error) {
+        errors.push(`stash (${page.container}): ${error.message}`);
+        criticalErrors.push(`stash (${page.container}): ${error.message}`);
+      }
+    }
+
     const hasGameData = Boolean(
       body.player_skills?.length ||
         body.player_quests?.length ||
@@ -311,7 +423,8 @@ Deno.serve(async (req) => {
         body.player_diaries?.length ||
         body.player_combat_achievements?.length ||
         replaceInventory ||
-        collectionLogPages.length,
+        collectionLogPages.length ||
+        stashPages.length,
     );
 
     // players row must exist before skills/quests (FK). Never trust nested rsn /
@@ -334,26 +447,56 @@ Deno.serve(async (req) => {
 
     if (body.player_skills?.length) {
       const rows = forceRsn(body.player_skills, rsn);
-      const { error } = await admin.from("player_skills").upsert(rows, {
-        onConflict: "rsn,skill",
+      const skillPayload = rows.map((r) => ({
+        skill: r.skill,
+        level: r.level,
+        xp: r.xp,
+      }));
+      const { error } = await admin.rpc("sync_upsert_skills", {
+        p_rsn: rsn,
+        p_skills: skillPayload,
       });
-      if (error) errors.push(`skills: ${error.message}`);
+      if (error) {
+        if (/sync_upsert_skills|function .* does not exist/i.test(error.message)) {
+          const ups = await admin.from("player_skills").upsert(rows, {
+            onConflict: "rsn,skill",
+          });
+          if (ups.error) errors.push(`skills: ${ups.error.message}`);
+        } else {
+          errors.push(`skills: ${error.message}`);
+        }
+      }
 
-      const today = new Date().toISOString().slice(0, 10);
-      const snaps = rows
-        .filter((r) => r.skill != null && r.xp != null)
-        .map((r) => ({
-          rsn,
-          snap_date: today,
-          skill: r.skill,
-          level: r.level ?? 1,
-          xp: r.xp,
-        }));
-      if (snaps.length) {
-        const { error: snapError } = await admin
-          .from("player_snapshots")
-          .upsert(snaps, { onConflict: "rsn,snap_date,skill" });
-        if (snapError) errors.push(`snapshots: ${snapError.message}`);
+      const packed = packSkillSnapshot(rows);
+      if (Object.keys(packed).length) {
+        const bucket = xpSnapshotBucket();
+        const { data: existing, error: existErr } = await admin
+          .from("player_xp_snapshots")
+          .select("snapped_at")
+          .eq("rsn", rsn)
+          .eq("snapped_at", bucket)
+          .maybeSingle();
+        if (existErr && !/player_xp_snapshots|schema cache/i.test(existErr.message)) {
+          errors.push(`snapshots lookup: ${existErr.message}`);
+        } else if (!existing) {
+          const { error: snapError } = await admin.from("player_xp_snapshots").insert({
+            rsn,
+            snapped_at: bucket,
+            skills: packed,
+          });
+          if (snapError && !/duplicate key|23505/i.test(snapError.message)) {
+            errors.push(`snapshots: ${snapError.message}`);
+          }
+          if (!snapError && Math.random() < 0.05) {
+            const cutoff = new Date(
+              Date.now() - XP_SNAPSHOT_KEEP_DAYS * 864e5,
+            ).toISOString();
+            await admin.from("player_xp_snapshots").delete().eq("rsn", rsn).lt(
+              "snapped_at",
+              cutoff,
+            );
+          }
+        }
       }
     }
     if (body.player_quests?.length) {
@@ -396,14 +539,25 @@ Deno.serve(async (req) => {
       if (error) errors.push(`combat_achievements: ${error.message}`);
     }
 
-    if (body.touch_last_synced !== false) {
-      const { error } = await admin
-        .from("players")
-        .upsert(
-          { rsn, last_synced: new Date().toISOString() },
-          { onConflict: "rsn" },
-        );
-      if (error) errors.push(`last_synced: ${error.message}`);
+    if (body.touch_last_synced !== false &&
+      !isHighChurnOnly(body, replaceInventory, collectionLogPages, stashPages)) {
+      const { error } = await admin.rpc("touch_player_last_synced", {
+        p_rsn: rsn,
+        p_min_interval_seconds: LAST_SYNCED_MIN_SECONDS,
+      });
+      if (error) {
+        if (/touch_player_last_synced|function .* does not exist/i.test(error.message)) {
+          const { error: fallbackErr } = await admin
+            .from("players")
+            .upsert(
+              { rsn, last_synced: new Date().toISOString() },
+              { onConflict: "rsn" },
+            );
+          if (fallbackErr) errors.push(`last_synced: ${fallbackErr.message}`);
+        } else {
+          errors.push(`last_synced: ${error.message}`);
+        }
+      }
     }
 
     if (typeof body.profile_public === "boolean" && resolved.claimed) {
