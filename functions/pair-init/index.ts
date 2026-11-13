@@ -1,13 +1,9 @@
 /**
  * POST /pair-init — called by the RuneLite plugin to start (or refresh) pairing.
  *
- * Anyone can call this with any RSN; that is by design. Knowing an RSN grants
- * nothing: the pairing code is only ever displayed inside the RuneLite client
- * of whoever made the request, so a code can only be claimed by someone who
- * can see that client. For an RSN that is already linked the existing sync
- * token is reused (re-pairing on a new PC keeps the same data); otherwise a
- * new token is minted. Rate limits (per IP and per RSN) blunt code-guessing
- * and enumeration.
+ * Issues a fresh pending credential. Existing credentials are never returned.
+ * A pending token has no data access until a signed-in user claims the code;
+ * replacing an existing character token requires that character's owner.
  *
  * Response: { code, sync_token, expires_in, linked }
  */
@@ -40,7 +36,7 @@ Deno.serve(async (req) => {
     return errorResponse("Invalid JSON body");
   }
 
-  const rsn = body.rsn?.trim();
+  const rsn = typeof body?.rsn === "string" ? body.rsn.trim() : "";
   if (!rsn || rsn.length > 32) {
     return errorResponse("rsn is required");
   }
@@ -63,43 +59,9 @@ Deno.serve(async (req) => {
     .is("claimed_by", null)
     .lt("expires_at", new Date().toISOString());
 
-  const { data: existing } = await admin
-    .from("user_characters")
-    .select("sync_token, user_id")
-    .eq("rsn", rsn)
-    .maybeSingle();
-
-  if (existing?.sync_token) {
-    const code = generatePairCode();
-    const expiresAt = new Date(Date.now() + PAIR_TTL_MINUTES * 60 * 1000).toISOString();
-
-    await admin.from("pair_sessions").delete().eq("rsn", rsn).is("claimed_by", null);
-
-    const { error: insertErr } = await admin.from("pair_sessions").insert({
-      code,
-      rsn,
-      sync_token: existing.sync_token,
-      expires_at: expiresAt,
-    });
-
-    if (insertErr) {
-      console.error("pair-init existing insert", insertErr);
-      return errorResponse("Failed to create pair session", 500);
-    }
-
-    return jsonResponse({
-      code,
-      sync_token: existing.sync_token,
-      expires_in: PAIR_TTL_MINUTES * 60,
-      linked: true,
-    });
-  }
-
   const syncToken = crypto.randomUUID();
   const code = generatePairCode();
   const expiresAt = new Date(Date.now() + PAIR_TTL_MINUTES * 60 * 1000).toISOString();
-
-  await admin.from("pair_sessions").delete().eq("rsn", rsn).is("claimed_by", null);
 
   const { error: insertErr } = await admin.from("pair_sessions").insert({
     code,
